@@ -1,13 +1,19 @@
 /**
  * Minimal SQL migration runner for the demo service.
  *
- *   node scripts/migrate.mjs up   <db>   apply every *_up.sql in order, then seed.sql
- *   node scripts/migrate.mjs down <db>   revert the highest-numbered migration
+ *   node scripts/migrate.mjs up <db>
+ *       Apply every migration except the latest, load seed.sql (this is the
+ *       "production" state the release inherits), then apply the latest migration.
+ *
+ *   node scripts/migrate.mjs down <db>
+ *       Revert the highest-numbered migration.
+ *
  *   node scripts/migrate.mjs verify-rollback <db>
- *       apply everything except the latest migration (+ seed) and snapshot the DB;
- *       then apply the latest up followed by the latest down and snapshot again.
- *       Exit 0 if the two snapshots are identical (the latest migration reverses
- *       cleanly), 1 if they differ (data or schema was lost). Prints the diff.
+ *       Snapshot the DB at the pre-latest-migration state (everything except the
+ *       latest migration, plus seed). Then apply the latest up followed by the
+ *       latest down and snapshot again. Exit 0 if the two snapshots are identical
+ *       (the latest migration reverses cleanly), 1 if they differ (data or schema
+ *       was lost). Prints the diff.
  *
  * Release Guardian's Rollback Check runs `verify-rollback` in a sandbox against the
  * release candidate's checkout.
@@ -42,15 +48,9 @@ function sqlFor(id, direction) {
   return readFileSync(join(MIG_DIR, file), 'utf8');
 }
 
-function applyUp(db, id) {
-  db.exec(sqlFor(id, 'up'));
-}
-function applyDown(db, id) {
-  db.exec(sqlFor(id, 'down'));
-}
-function seed(db) {
-  db.exec(readFileSync(join(MIG_DIR, 'seed.sql'), 'utf8'));
-}
+const applyUp = (db, id) => db.exec(sqlFor(id, 'up'));
+const applyDown = (db, id) => db.exec(sqlFor(id, 'down'));
+const seed = (db) => db.exec(readFileSync(join(MIG_DIR, 'seed.sql'), 'utf8'));
 
 /** Full logical snapshot: every table's schema + all rows, order-stable. */
 function snapshot(db) {
@@ -69,31 +69,34 @@ function fresh(path) {
   return new Database(path);
 }
 
+/** Bring a fresh DB to the state the release inherits: earlier migrations + seed. */
+function toPreLatest(db, earlier) {
+  for (const id of earlier) applyUp(db, id);
+  seed(db);
+}
+
 const ids = migrationIds();
+const latest = ids.at(-1);
+const earlier = ids.slice(0, -1);
 
 if (cmd === 'up') {
   const db = fresh(dbPath);
-  for (const id of ids) applyUp(db, id);
-  seed(db);
-  console.log(`applied ${ids.length} migration(s) + seed -> ${dbPath}`);
+  toPreLatest(db, earlier);
+  applyUp(db, latest);
+  console.log(`applied ${ids.length} migration(s) over seed -> ${dbPath}`);
   process.exit(0);
 }
 
 if (cmd === 'down') {
   const db = new Database(dbPath);
-  const latest = ids.at(-1);
   applyDown(db, latest);
   console.log(`reverted ${latest} on ${dbPath}`);
   process.exit(0);
 }
 
 if (cmd === 'verify-rollback') {
-  const latest = ids.at(-1);
-  const earlier = ids.slice(0, -1);
-
   const db = fresh(dbPath);
-  for (const id of earlier) applyUp(db, id);
-  seed(db);
+  toPreLatest(db, earlier);
   const before = JSON.stringify(snapshot(db));
 
   applyUp(db, latest);
