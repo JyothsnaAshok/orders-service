@@ -1,0 +1,15 @@
+{
+  "name": "orders-service",
+  "version": "1.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Demo release candidate analysed by Release Guardian.",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "test": "node --test",
+    "migrate": "node scripts/migrate.mjs"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.8.1"
+  }
+}
