@@ -3,7 +3,7 @@
  * release candidate to show a real code diff alongside the schema change.
  */
 
-/** @typedef {{ id: number, customer: string, total_cents: number, status?: string }} Order */
+/** @typedef {{ id: number, customer: string, total_cents: number, priority?: number }} Order */
 
 /** Total value of all orders, in cents. */
 export function totalCents(/** @type {Order[]} */ orders) {
@@ -15,17 +15,7 @@ export function forCustomer(/** @type {Order[]} */ orders, /** @type {string} */
   return orders.filter((o) => o.customer === customer);
 }
 
-/** Human label for an order's fulfilment state. */
-export function statusLabel(/** @type {Order} */ order) {
-  switch (order.status) {
-    case 'shipped':
-      return 'Shipped';
-    case 'refunded':
-      return 'Refunded';
-    case 'pending':
-    case undefined:
-      return 'Pending';
-    default:
-      return order.status;
-  }
+/** Orders sorted highest priority first, then by id. Priority defaults to 0. */
+export function byPriority(/** @type {Order[]} */ orders) {
+  return [...orders].sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0) || a.id - b.id);
 }
