@@ -13,8 +13,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-      - run: npm install
       - name: unit tests
         run: npm test
       - name: migrations apply cleanly
-        run: node scripts/migrate.mjs up ./ci.sqlite
+        run: node scripts/migrate.mjs up

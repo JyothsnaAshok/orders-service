@@ -1,38 +1,33 @@
 /**
- * Minimal SQL migration runner for the demo service.
+ * Minimal migration runner for the demo service — zero dependencies.
  *
- *   node scripts/migrate.mjs up <db>
- *       Apply every migration except the latest, load seed.sql (this is the
- *       "production" state the release inherits), then apply the latest migration.
+ *   node scripts/migrate.mjs up
+ *   node scripts/migrate.mjs verify-rollback
  *
- *   node scripts/migrate.mjs down <db>
- *       Revert the highest-numbered migration.
+ * `verify-rollback` brings a fresh in-memory DB to the state the release inherits
+ * (every migration except the latest, plus seed.sql), snapshots it, then applies
+ * the latest up followed by the latest down and snapshots again. Exit 0 if the two
+ * snapshots are identical (the latest migration reverses cleanly), 1 if they differ
+ * (schema or row content was lost).
  *
- *   node scripts/migrate.mjs verify-rollback <db>
- *       Snapshot the DB at the pre-latest-migration state (everything except the
- *       latest migration, plus seed). Then apply the latest up followed by the
- *       latest down and snapshot again. Exit 0 if the two snapshots are identical
- *       (the latest migration reverses cleanly), 1 if they differ (data or schema
- *       was lost). Prints the diff.
- *
- * Release Guardian's Rollback Check runs `verify-rollback` in a sandbox against the
- * release candidate's checkout.
+ * It interprets the tiny SQL subset the migrations use (CREATE/DROP TABLE, ALTER
+ * TABLE ADD/DROP COLUMN, CREATE/DROP INDEX, INSERT ... VALUES) over plain objects —
+ * no SQLite, no `npm install`. Release Guardian's Rollback Check runs this in a
+ * sandbox against the candidate checkout.
  */
 
-import Database from 'better-sqlite3';
-import { readFileSync, readdirSync, rmSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const MIG_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'migrations');
 
-const [, , cmd, dbPath] = process.argv;
-if (!cmd || !dbPath) {
-  console.error('usage: migrate.mjs <up|down|verify-rollback> <db-path>');
+const [, , cmd] = process.argv;
+if (cmd !== 'up' && cmd !== 'verify-rollback') {
+  console.error('usage: migrate.mjs <up|verify-rollback>');
   process.exit(2);
 }
 
-/** Ordered migration numbers, e.g. ['0001','0002','0003']. */
 function migrationIds() {
   const ids = new Set();
   for (const f of readdirSync(MIG_DIR)) {
@@ -41,77 +36,153 @@ function migrationIds() {
   }
   return [...ids].sort();
 }
+const sqlFor = (id, dir) => {
+  const f = readdirSync(MIG_DIR).find((n) => n.startsWith(`${id}_`) && n.endsWith(`_${dir}.sql`));
+  if (!f) throw new Error(`no ${dir} migration for ${id}`);
+  return readFileSync(join(MIG_DIR, f), 'utf8');
+};
+const seedSql = () => readFileSync(join(MIG_DIR, 'seed.sql'), 'utf8');
 
-function sqlFor(id, direction) {
-  const file = readdirSync(MIG_DIR).find((f) => f.startsWith(`${id}_`) && f.endsWith(`_${direction}.sql`));
-  if (!file) throw new Error(`no ${direction} migration for ${id}`);
-  return readFileSync(join(MIG_DIR, file), 'utf8');
+// --- tiny SQL interpreter over { tables: { name: { columns, rows, indexes } } } ---
+
+function stripComments(sql) {
+  return sql
+    .split('\n')
+    .map((l) => l.replace(/--.*$/, ''))
+    .join('\n');
 }
 
-const applyUp = (db, id) => db.exec(sqlFor(id, 'up'));
-const applyDown = (db, id) => db.exec(sqlFor(id, 'down'));
-const seed = (db) => db.exec(readFileSync(join(MIG_DIR, 'seed.sql'), 'utf8'));
+function statements(sql) {
+  return stripComments(sql)
+    .split(';')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
 
-/** Full logical snapshot: every table's schema + all rows, order-stable. */
+function parseColumnDefs(body) {
+  // split on commas that are not inside parens
+  const parts = [];
+  let depth = 0;
+  let cur = '';
+  for (const ch of body) {
+    if (ch === '(') depth++;
+    if (ch === ')') depth--;
+    if (ch === ',' && depth === 0) {
+      parts.push(cur.trim());
+      cur = '';
+    } else cur += ch;
+  }
+  if (cur.trim()) parts.push(cur.trim());
+  return parts
+    .filter((p) => !/^(PRIMARY|FOREIGN|UNIQUE|CHECK|CONSTRAINT)\b/i.test(p))
+    .map((p) => {
+      const name = p.split(/\s+/)[0].replace(/["'`]/g, '');
+      const def = /DEFAULT\s+('[^']*'|"[^"]*"|\S+)/i.exec(p);
+      return {
+        name,
+        notNull: /\bNOT\s+NULL\b/i.test(p),
+        default: def ? unquote(def[1]) : null,
+      };
+    });
+}
+
+function unquote(v) {
+  const t = v.trim();
+  if (/^'.*'$/.test(t) || /^".*"$/.test(t)) return t.slice(1, -1);
+  if (/^-?\d+$/.test(t)) return Number(t);
+  return t;
+}
+
+function splitTuple(inner) {
+  const out = [];
+  let cur = '';
+  let q = null;
+  for (const ch of inner) {
+    if (q) {
+      if (ch === q) q = null;
+      else cur += ch;
+    } else if (ch === "'" || ch === '"') q = ch;
+    else if (ch === ',') {
+      out.push(cur.trim());
+      cur = '';
+    } else cur += ch;
+  }
+  out.push(cur.trim());
+  return out.map((x) => (/^-?\d+$/.test(x) ? Number(x) : x));
+}
+
+function exec(db, sql) {
+  for (const stmt of statements(sql)) {
+    let m;
+    if ((m = /^CREATE TABLE\s+(\w+)\s*\(([\s\S]+)\)$/i.exec(stmt))) {
+      db.tables[m[1]] = { columns: parseColumnDefs(m[2]), rows: [], indexes: [] };
+    } else if ((m = /^DROP TABLE\s+(\w+)$/i.exec(stmt))) {
+      delete db.tables[m[1]];
+    } else if ((m = /^CREATE INDEX\s+(\w+)\s+ON\s+(\w+)/i.exec(stmt))) {
+      db.tables[m[2]].indexes.push(m[1]);
+    } else if ((m = /^DROP INDEX\s+(\w+)$/i.exec(stmt))) {
+      for (const t of Object.values(db.tables)) t.indexes = t.indexes.filter((i) => i !== m[1]);
+    } else if ((m = /^ALTER TABLE\s+(\w+)\s+ADD COLUMN\s+([\s\S]+)$/i.exec(stmt))) {
+      const [col] = parseColumnDefs(m[2]);
+      const t = db.tables[m[1]];
+      t.columns.push(col);
+      for (const r of t.rows) r[col.name] = col.default;
+    } else if ((m = /^ALTER TABLE\s+(\w+)\s+DROP COLUMN\s+(\w+)$/i.exec(stmt))) {
+      const t = db.tables[m[1]];
+      t.columns = t.columns.filter((c) => c.name !== m[2]);
+      for (const r of t.rows) delete r[m[2]];
+    } else if ((m = /^INSERT INTO\s+(\w+)\s*\(([^)]+)\)\s*VALUES\s*([\s\S]+)$/i.exec(stmt))) {
+      const cols = m[2].split(',').map((c) => c.trim());
+      const tuples = m[3].match(/\(([^)]*)\)/g) || [];
+      for (const tup of tuples) {
+        const vals = splitTuple(tup.slice(1, -1));
+        const row = {};
+        cols.forEach((c, i) => (row[c] = vals[i]));
+        db.tables[m[1]].rows.push(row);
+      }
+    } else {
+      throw new Error(`unsupported statement: ${stmt.slice(0, 60)}`);
+    }
+  }
+}
+
 function snapshot(db) {
-  const tables = db
-    .prepare("SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
-    .all();
-  return tables.map((t) => {
-    const cols = db.prepare(`PRAGMA table_info(${t.name})`).all().map((c) => c.name);
-    const rows = db.prepare(`SELECT * FROM ${t.name} ORDER BY ${cols[0]}`).all();
-    return { table: t.name, schema: t.sql.replace(/\s+/g, ' ').trim(), rows };
-  });
-}
-
-function fresh(path) {
-  rmSync(path, { force: true });
-  return new Database(path);
-}
-
-/** Bring a fresh DB to the state the release inherits: earlier migrations + seed. */
-function toPreLatest(db, earlier) {
-  for (const id of earlier) applyUp(db, id);
-  seed(db);
+  return JSON.stringify(
+    Object.entries(db.tables)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([name, t]) => ({
+        table: name,
+        columns: t.columns.map((c) => c.name),
+        indexes: [...t.indexes].sort(),
+        rows: [...t.rows].sort((x, y) => JSON.stringify(x).localeCompare(JSON.stringify(y))),
+      })),
+  );
 }
 
 const ids = migrationIds();
 const latest = ids.at(-1);
 const earlier = ids.slice(0, -1);
 
+const db = { tables: {} };
+for (const id of earlier) exec(db, sqlFor(id, 'up'));
+exec(db, seedSql());
+
 if (cmd === 'up') {
-  const db = fresh(dbPath);
-  toPreLatest(db, earlier);
-  applyUp(db, latest);
-  console.log(`applied ${ids.length} migration(s) over seed -> ${dbPath}`);
+  exec(db, sqlFor(latest, 'up'));
+  console.log(`applied ${ids.length} migration(s) over seed`);
   process.exit(0);
 }
 
-if (cmd === 'down') {
-  const db = new Database(dbPath);
-  applyDown(db, latest);
-  console.log(`reverted ${latest} on ${dbPath}`);
+const before = snapshot(db);
+exec(db, sqlFor(latest, 'up'));
+exec(db, sqlFor(latest, 'down'));
+const after = snapshot(db);
+
+if (before === after) {
+  console.log(`OK: migration ${latest} reverses cleanly (schema + row content match)`);
   process.exit(0);
 }
-
-if (cmd === 'verify-rollback') {
-  const db = fresh(dbPath);
-  toPreLatest(db, earlier);
-  const before = JSON.stringify(snapshot(db));
-
-  applyUp(db, latest);
-  applyDown(db, latest);
-  const after = JSON.stringify(snapshot(db));
-
-  if (before === after) {
-    console.log(`OK: migration ${latest} reverses cleanly (snapshots match)`);
-    process.exit(0);
-  }
-  console.error(`LOSS: migration ${latest} does not reverse cleanly.`);
-  console.error('before:', before);
-  console.error('after :', after);
-  process.exit(1);
-}
-
-console.error(`unknown command: ${cmd}`);
-process.exit(2);
+console.error(`LOSS: migration ${latest} does not reverse cleanly.`);
+console.error('pre-migration :', before);
+console.error('after up+down :', after);
+process.exit(1);
