@@ -14,7 +14,7 @@ service — it exists so the Guardian's checks have a real GitHub repo to read:
 ```
 migrations/      NNNN_up.sql / NNNN_down.sql pairs + seed.sql
 src/             the tiny orders module the migrations back
-scripts/         migrate.mjs — apply up/down migrations to a SQLite file
+scripts/         migrate.mjs — SQL-subset interpreter (zero deps): apply migrations / verify rollback
 .github/workflows/ci.yml   runs the migration round-trip + the unit test
 ```
 
@@ -31,8 +31,6 @@ catches that `v1.3.0` is not safely reversible.
 ## Run locally
 
 ```bash
-npm install
 npm test
-node scripts/migrate.mjs up   ./data.sqlite
-node scripts/migrate.mjs down ./data.sqlite
+node scripts/migrate.mjs up
 ```
